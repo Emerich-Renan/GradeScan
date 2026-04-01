@@ -2,61 +2,88 @@ import cv2
 import numpy as np
 import os
 import fitz  # PyMuPDF
+import pytesseract
+import csv
 
-########################################
-path_gabarito = "gabarito.jpg"  # gabarito
-pasta_respostas = "respostas"   # pasta com PDFs/JPGs dos cartões
+# -----------------------------
+# CONFIGURAÇÃO TESSERACT
+# -----------------------------
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+os.environ["TESSDATA_PREFIX"] = r"C:\Program Files\Tesseract-OCR\tessdata"
+
+# -----------------------------
+# CONFIGURAÇÃO
+# -----------------------------
+path_gabarito = "gabarito.jpg"
+pasta_respostas = "respostas"
 widthImg = 1000
 heightImg = 1000
-########################################
+
+PORCENTAGEM_CAMPONOME = 0.21
+
+MIN_AREA = 150
+MAX_AREA = 220
+MIN_FILL = 0.3
+MAX_FILL = 0.9
+MIN_DIFF = 10
 
 # -----------------------------
-# FUNÇÃO DE PROCESSAMENTO
+# PROCESSAR RESPOSTAS
 # -----------------------------
 def processar(img):
-    img = cv2.resize(img,(widthImg,heightImg))
+    img = cv2.resize(img, (widthImg, heightImg))
     imgGray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    imgBlur = cv2.GaussianBlur(imgGray,(5,5),1)
+    imgBlur = cv2.GaussianBlur(imgGray, (5,5), 1)
+
     imgThresh = cv2.adaptiveThreshold(
         imgBlur, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        15, 4
+        cv2.THRESH_BINARY_INV, 15, 4
     )
+
     kernel = np.ones((3,3), np.uint8)
     imgDil = cv2.dilate(imgThresh, kernel, iterations=1)
-    cv2.imshow("Thresh", imgThresh)
-    cv2.waitKey(0)
 
-    countours, _ = cv2.findContours(imgDil, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(imgDil, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
     bubbleContours = []
 
-    for cnt in countours:
+    for cnt in contours:
         area = cv2.contourArea(cnt)
-        if 150 < area < 220:
+        if MIN_AREA < area < MAX_AREA:
             perimeter = cv2.arcLength(cnt, True)
-            if perimeter == 0: continue
+            if perimeter == 0:
+                continue
+
             circularity = 4 * np.pi * (area / (perimeter * perimeter))
+
             if circularity > 0.7:
                 x, y, w, h = cv2.boundingRect(cnt)
                 roi = imgThresh[y:y+h, x:x+w]
+
                 filled = cv2.countNonZero(roi)
                 total = w * h
                 fillRatio = filled / float(total)
-                if 0.3 < fillRatio < 0.9:
+
+                if MIN_FILL < fillRatio < MAX_FILL:
                     bubbleContours.append(cnt)
 
     # separar esquerda/direita
     left, right = [], []
+
     for cnt in bubbleContours:
         x, y, w, h = cv2.boundingRect(cnt)
-        if x < widthImg // 2: left.append(cnt)
-        else: right.append(cnt)
+        if x < widthImg // 2:
+            left.append(cnt)
+        else:
+            right.append(cnt)
+
     left = sorted(left, key=lambda c: cv2.boundingRect(c)[1])
     right = sorted(right, key=lambda c: cv2.boundingRect(c)[1])
+
     bubbleContours = left + right
 
-    # separar por questão
+    # separar questões (5 alternativas)
     questions = []
     for i in range(0, len(bubbleContours), 5):
         questions.append(bubbleContours[i:i+5])
@@ -67,32 +94,66 @@ def processar(img):
     for q in questions:
         pixels = []
         q = sorted(q, key=lambda c: cv2.boundingRect(c)[0])
+
         for cnt in q:
             x, y, w, h = cv2.boundingRect(cnt)
             roi = imgThresh[y:y+h, x:x+w]
             pixels.append(cv2.countNonZero(roi))
-        if len(pixels)==5:
+
+        if len(pixels) == 5:
             maxVal = max(pixels)
             minVal = min(pixels)
-            if (maxVal - minVal) > 10:
+
+            if (maxVal - minVal) > MIN_DIFF:
                 markedIndex = pixels.index(maxVal)
                 answers.append(alternatives[markedIndex])
             else:
-                answers.append("V")
+                answers.append("V")  # em branco
+
     return answers
 
 # -----------------------------
-# FUNÇÃO DE CORREÇÃO
+# CORRIGIR
 # -----------------------------
 def corrigir(respostas, gabarito):
     acertos = 0
     erros = []
+
     for i in range(len(gabarito)):
-        if i < len(respostas) and respostas[i]==gabarito[i]:
+        if i < len(respostas) and respostas[i] == gabarito[i]:
             acertos += 1
         else:
             erros.append(i+1)
+
     return acertos, erros
+
+# -----------------------------
+# OCR NOME
+# -----------------------------
+def ler_nome(img):
+    altura = img.shape[0]
+
+    y1 = int(altura * 0.22)
+    y2 = int(altura * 0.26)
+    x1 = int(img.shape[1] * 0.13)
+    x2 = int(img.shape[1] * 0.6)
+
+    nome_area = img[y1:y2, x1:x2]
+
+    gray = cv2.cvtColor(nome_area, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+
+    _, thresh = cv2.threshold(
+        gray, 0, 255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    thresh = cv2.medianBlur(thresh, 3)
+
+    nome = pytesseract.image_to_string(thresh, lang='eng')
+    nome = nome.strip()
+
+    return nome if nome else "NOME_DESCONHECIDO"
 
 # -----------------------------
 # CARREGAR GABARITO
@@ -100,10 +161,11 @@ def corrigir(respostas, gabarito):
 if not os.path.exists(path_gabarito):
     print(f"Gabarito não encontrado em {path_gabarito}")
     exit()
+
 imgGabarito = cv2.imread(path_gabarito)
 gabarito = processar(imgGabarito)
-print("\nGABARITO:")
-print(gabarito)
+
+print("GABARITO:", gabarito)
 
 # -----------------------------
 # PROCESSAR ARQUIVOS
@@ -113,20 +175,26 @@ if not os.path.exists(pasta_respostas):
     exit()
 
 arquivos = os.listdir(pasta_respostas)
-print("\nCORREÇÃO EM MASSA:")
+resultados = []
 
 for arquivo in arquivos:
     caminho = os.path.join(pasta_respostas, arquivo)
 
-    # IMAGENS
+    # IMAGEM
     if arquivo.lower().endswith((".jpg",".jpeg",".png")):
         img = cv2.imread(caminho)
+
         if img is None:
             print(f"{arquivo}: erro ao carregar")
             continue
+
+        nome = ler_nome(img)
         respostas = processar(img)
         acertos, erros = corrigir(respostas, gabarito)
-        print(f"{arquivo}: {acertos}/{len(gabarito)} | erros: {erros}")
+
+        resultados.append([nome, acertos, erros])
+
+        print(f"{nome}: {acertos}/{len(gabarito)} | erros: {erros}")
 
     # PDF
     elif arquivo.lower().endswith(".pdf"):
@@ -138,11 +206,32 @@ for arquivo in arquivos:
 
         for i, page in enumerate(doc):
             pix = page.get_pixmap(dpi=400)
-            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-            if pix.n==4:
+
+            img = np.frombuffer(
+                pix.samples, dtype=np.uint8
+            ).reshape(pix.height, pix.width, pix.n)
+
+            if pix.n == 4:
                 img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
             else:
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+            nome = ler_nome(img)
             respostas = processar(img)
             acertos, erros = corrigir(respostas, gabarito)
-            print(f"{arquivo} pág {i+1}: {acertos}/{len(gabarito)} | erros: {erros}")
+
+            resultados.append([nome, acertos, erros])
+
+            print(f"{arquivo} pág {i+1} - {nome}: {acertos}/{len(gabarito)} | erros: {erros}")
+
+# -----------------------------
+# SALVAR CSV
+# -----------------------------
+with open("resultados.csv", "w", newline="", encoding="utf-8") as f:
+    writer = csv.writer(f)
+    writer.writerow(["Nome", "Acertos", "Erros"])
+
+    for r in resultados:
+        writer.writerow([r[0], r[1], r[2]])
+
+print("\nTodos os resultados salvos em resultados.csv")
